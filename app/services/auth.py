@@ -1,4 +1,5 @@
 import hashlib, hmac, time, threading, requests, logging
+from typing import Optional
 from config.settings import Config
 
 logger = logging.getLogger("wechat-robot")
@@ -14,7 +15,7 @@ def check_signature(signature, timestamp, nonce) -> bool:
     return hmac.compare_digest(digest, signature)
 
 
-def get_access_token(force_refresh=False) -> str | None:
+def get_access_token(force_refresh=False) -> Optional[str]:
     if not (Config.WECHAT_APPID and Config.WECHAT_APPSECRET):
         return None
     with _token_lock:
