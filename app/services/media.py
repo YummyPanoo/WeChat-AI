@@ -1,4 +1,5 @@
 import logging
+import requests
 from .auth import wechat_api
 
 logger = logging.getLogger(__name__)
@@ -25,3 +26,14 @@ def upload_temp_media(media_type, file_bytes, filename="image.jpg"):
         return result["media_id"]
     logger.error("上传素材失败: %s", result)
     return None
+
+
+def fetch_image_bytes(url):
+    """下载指定 URL 的图片字节，失败返回 None。"""
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        logger.exception("下载图片失败: %s", url)
+        return None

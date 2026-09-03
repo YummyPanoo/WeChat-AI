@@ -9,9 +9,9 @@ def create_app():
     # 初始化日志
     setup_logger("wechat-robot", Config.LOG_LEVEL)
 
-    # 注册蓝图
+    # 注册蓝图：微信公众号
     from app.routes.wechat import bp as wechat_bp
-    app.register_blueprint(wechat_bp)
+    app.register_blueprint(wechat_bp, url_prefix="/wechat")
 
     @app.route("/")
     def index():
