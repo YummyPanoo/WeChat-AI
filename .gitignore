@@ -1,6 +1,9 @@
 # 环境变量（含密钥！）
 .env
 
+# 配置文件（含密钥）
+config/settings.py
+
 # Python
 __pycache__/
 *.py[cod]
