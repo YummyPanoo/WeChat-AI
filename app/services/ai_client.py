@@ -1,3 +1,4 @@
+import json
 import requests, logging, time
 from typing import List, Optional
 from config.settings import Config
@@ -6,6 +7,16 @@ logger = logging.getLogger("wechat-robot")
 
 # 复用 TCP 连接，减少每次请求的握手开销
 _session = requests.Session()
+
+# 系统提示词：声明机器人具备文生图能力，避免 AI 在对话中否认自己会画画。
+# 实际的绘画事件（用户指令 + 生成结果）由路由层写入会话历史，AI 据此回答"你画了什么"。
+SYSTEM_PROMPT = (
+    "你是微信公众号里的智能助手。除了文字聊天，你还具备两个能力："
+    "1) 分析用户发送的图片；"
+    "2) 根据用户描述生成图片（用户说\"画：xxx\"等指令时，系统会为你调用绘图功能，"
+    "绘画记录会出现在对话历史中）。"
+    "请用简洁自然的中文回复。"
+)
 
 
 def chat(prompt: str, history: Optional[List[dict]] = None, timeout: int = 120) -> str:
@@ -17,6 +28,9 @@ def chat(prompt: str, history: Optional[List[dict]] = None, timeout: int = 120) 
         return "AI服务未配置"
     try:
         messages = list(history or [])
+        # 会话历史里不含 system 消息，每次请求时注入能力声明
+        if not messages or messages[0].get("role") != "system":
+            messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         messages.append({"role": "user", "content": prompt})
         start = time.time()
         resp = _session.post(
@@ -61,6 +75,44 @@ def vision(image_url: str, prompt: str, timeout=120) -> str:
     except Exception:
         logger.exception("Qwen VL API异常")
         return "图片分析服务不可用"
+
+
+def classify_draw_intent(text: str, timeout: int = 5) -> Optional[str]:
+    """轻量 LLM 意图判断：用户这句话是不是在要一张图。
+    是则返回清理后的绘图 prompt；否则返回 None（含调用失败）。
+    仅当正则拿不准时调用；耗时一般 < 300ms（qwen-turbo）。
+    """
+    if not Config.DASHSCOPE_API_KEY:
+        return None
+    system = (
+        "你是微信消息意图分类器，判断用户这句话是否想要生成/绘制一张图片。"
+        "注意：'看图片/评价图片/问图片内容/问怎么画画/讲一幅画'等只是看图，不是绘图请求；"
+        "'画面很美/画展好看'等是评价，也不是绘图请求。"
+        "若是绘图请求，提取核心绘图描述（去掉'给我''帮我''请''画一张'等指令词和量词），"
+        "只输出 JSON：{\"draw\": true, \"prompt\": \"核心描述\"}；否则 {\"draw\": false}。不要输出任何其他内容。"
+    )
+    try:
+        resp = _session.post(
+            Config.DASHSCOPE_API_URL,
+            headers={"Authorization": f"Bearer {Config.DASHSCOPE_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": Config.QWEN_CLASSIFY_MODEL,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
+                "max_tokens": 40,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        data = json.loads(content)
+        if data.get("draw"):
+            prompt = (data.get("prompt") or "").strip()
+            return prompt or None
+        return None
+    except Exception:
+        logger.warning("绘图意图分类失败（按非绘图处理）: %s", (text or "")[:30])
+        return None
 
 
 def generate_image(prompt: str, size: str = "1024*1024", timeout: int = 120):

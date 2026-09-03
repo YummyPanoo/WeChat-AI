@@ -1,9 +1,10 @@
 import re, time, threading, logging, base64
+from typing import Optional
 from flask import Blueprint, request
 from defusedxml import ElementTree as SafeET
 from config.settings import Config
 from app.services.auth import check_signature
-from app.services.ai_client import chat, vision, generate_image
+from app.services.ai_client import chat, vision, generate_image, classify_draw_intent
 from app.services.message import send_customer_text, send_customer_image
 from app.services.pending import get_or_start, drain_ready, get_or_start_image, pop_pending_image, process_later
 from app.services.media import download_media, upload_temp_media, fetch_image_bytes
@@ -46,35 +47,144 @@ def _with_backfill(openid: str, reply: str) -> str:
     return combined[:2000] if len(combined) > 2000 else combined
 
 
+import re
+
+# 紧跟“画”之后的这些汉字多为非绘画意图的词头（画面/画作/画廊/画展/画师/画家…）
+_NON_DRAW_HEAD = set("面作廊展师家稿纸板框皮眉眼册报质法理卷轴画像画眉商家风工屏境坛舫架局谜")
+# 成语（画龙点睛等修辞用法，不是真的让人画画）
+_CHENGYU = ("画龙点睛", "画蛇添足", "画饼充饥", "画地为牢", "画虎类犬", "画影图形")
+# 明显是“看图/评图/问图”而不是“要生成图”的查询词（命中直接返回 None，不调 LLM）
+_LOOK_WORDS = ("看看", "看下", "看一下", "讲讲", "讲一下", "介绍", "识别", "分析", "解读",
+               "是什么", "是什么意思", "啥意思", "评价", "评论", "描述一下", "怎么画", "如何",
+               "怎么样", "咋样", "画的")
+# 弱信号词：文本含这些词但拿不准 → 调用轻量 LLM 判断绘图意图（命中且非反意图词）
+_WEAK_HINTS = ("画", "图", "图片", "照片", "壁纸", "插画", "插图", "生成", "绘制", "素描", "卡通",
+               "画像", "图画", "图像", "美图", "图案", "背景", "头像", "漫画", "一幅", "一张")
+# 强指令前缀（命中直接判定为绘图请求，不调 LLM）
+_STRONG_PREFIX = ("生成图片", "文生图", "画图", "绘画", "作画")
+_STRONG_EN = ("image", "draw", "t2i")
+# ---- 绘图意图分类结果缓存（同一文本 5 分钟只调一次 LLM）----
+_CLASSIFY_TTL = 300
+_classify_cache = {}
+_classify_lock = threading.Lock()
+
+
+def _classify_cached(text: str) -> Optional[str]:
+    """带缓存的 LLM 绘图意图判断；返回清理后的 prompt 或 None"""
+    now = time.time()
+    with _classify_lock:
+        hit = _classify_cache.get(text)
+        if hit and now - hit[1] <= _CLASSIFY_TTL:
+            return hit[0]
+    try:
+        prompt = classify_draw_intent(text)
+    except Exception:
+        # classify_draw_intent 内部已捕获异常，这里再兜底一层，保证消息主流程绝不因分类失败而中断
+        logger.warning("绘图意图分类异常（按非绘图处理）: %s", (text or "")[:30])
+        return None
+    with _classify_lock:
+        _classify_cache[text] = (prompt, time.time())
+        # 控制缓存大小：超 500 条清理最旧一半
+        if len(_classify_cache) > 500:
+            stale = sorted(_classify_cache.items(), key=lambda kv: kv[1][1])[:250]
+            for k, _ in stale:
+                _classify_cache.pop(k, None)
+    if prompt:
+        return _clean_prompt(prompt) or None
+    return None
+
+
+def _clean_prompt(text):
+    """清理 prompt 开头的填充词与量词，尽量把语义核心留给绘图模型"""
+    text = (text or "").strip(" \t:：,，、。.？?！!；;()（）")
+    # 去掉开头的礼貌/引导/动词填充词（可连续剥多层，如“帮我做一张xxx”→“xxx”）
+    # (?!的) 保护：若剥完剩“的…”开头（如“你的样子”），说明误剥，回退不剥
+    text = re.sub(r"^(?:那就|就帮我|麻烦|帮我|给我|请你|你|我想|我要|我想要|来|请|那|就|"
+                  r"出(?:个|张)?|做(?:一?[张幅个])?|整(?:一?[个张])?|搞(?:一?[个张])?)+(?!的)", "", text)
+    # 量词短语整体剥掉（一张/一只/一头/一个…），只留语义核心
+    text = re.sub(r"^(?:一张|一个|一只|一头|一条|一匹|一幅|一朵|一棵|一株|一座|一辆|一艘|"
+                  r"一颗|一块|一对|一双|一组|一群|两张|两个|几只|几个|一下|一|个|只|张|幅|"
+                  r"头|条|匹|朵|棵|株|座|辆|艘|颗|块|对|双|组|群|下)?", "", text)
+    return text.strip()
+
+
 def parse_image_gen(content):
     """解析文生图指令，返回绘图 prompt；不是指令则返回 None。
-    支持: 画：xxx / 画 xxx / 生成图片 xxx / 文生图 xxx / image xxx / draw xxx
-    单字"画"需带冒号或空格，避免误伤"画面很好"这类普通句子。
+
+    支持的触发方式（更自由，不再要求必须带冒号/空格）：
+      - 强指令: 生成图片 xxx / 文生图 xxx / 画图 xxx / image xxx / draw xxx / t2i xxx
+      - 画 + 直接内容: 画一只小猪 / 画太阳 / 画个彩虹 / 画：xxx / 画 xxx
+      - 动词引导: 给我画一只狗 / 帮我生成一个彩虹 / 来画只猫 / 我想画一条龙
+      - 求图句式: 给我一张小狗在吃饭的图片 / 来一张夕阳的照片 / 我要一张可爱的猫咪插画
+    为避免误伤，含“看看/识别/分析/是什么”等查看类词的一律不触发。
     """
     content = (content or "").strip()
     if not content:
         return None
+    # 0) 语义过滤：明显是“看图/评图/问图”而不是“要生成图” → 不触发
+    if any(w in content for w in _LOOK_WORDS):
+        return None
+
+    # 1) 强指令前缀（保留原有能力）
     for kw in ("生成图片", "文生图", "画图"):
         if content.startswith(kw):
             rest = content[len(kw):].strip(" \t:：").strip()
-            if rest:
-                return rest
+            return _clean_prompt(rest) if rest else None
     low = content.lower()
     for kw in ("image", "draw", "t2i"):
         if low.startswith(kw):
             rest = content[len(kw):].strip(" \t:：").strip()
-            if rest:
-                return rest
+            return _clean_prompt(rest) if rest else None
+
+    # 2) “画”直接开头：画：xx / 画 xx / 画一只小猪 / 画太阳
     if content.startswith("画"):
-        rest = content[1:]
-        if rest.startswith(("：", ":")):
-            rest = rest[1:].strip()
-        elif rest[:1].isspace():
-            rest = rest.lstrip()
-        else:
-            return None
-        return rest if rest else None
-    return None
+        if any(content.startswith(c) for c in _CHENGYU):
+            return None  # 画龙点睛等成语 → 不是绘画指令
+        if len(content) > 1 and content[1] in ("：", ":"):
+            return _clean_prompt(content[2:]) or None
+        if len(content) > 1 and content[1].isspace():
+            return _clean_prompt(content[2:]) or None
+        if len(content) > 1 and content[1] not in _NON_DRAW_HEAD:
+            # 画猫咪 / 画夜晚的城市  —— 只要不是“画面/画作…”这类词头就可触发
+            return _clean_prompt(content[1:]) or None
+        return None  # 画面/画作/画展… → 普通聊天
+
+    # 3) 动词引导 + 画/生成/制作 等动作词
+    m = re.match(r"^(?:给我|帮我|帮|来|要|请|我想|我要|我想要|想要|麻烦|能不能|我来|求你|请你|给我来(?=[画生])|我)"
+                 r"(?P<body>[^，。!？!?；;]{0,14})$", content)
+    if m:
+        body = m.group("body")
+        for kw in ("画", "生成", "制作", "绘制", "做出来", "出图"):
+            idx = body.find(kw)
+            if idx >= 0:
+                rest = body[idx + len(kw):]
+                # 防止“帮我看看这幅画面”“我今天画了一下午”这类“画了/画+名词”叙述
+                if not rest or rest[0] in _NON_DRAW_HEAD or rest.startswith("了"):
+                    continue
+                cleaned = _clean_prompt(rest)
+                if cleaned:
+                    return cleaned
+        # 3.5) “给我一张图”这类（有量词没画字）落入句式4
+
+    # 4) “给我一张 xxx (的) 图片/照片/图” 句式
+    m = re.match(
+        r"^(?:给我来|请给我|帮我出|给我|帮我|来张|来|要|我要|我想要|想要|请|求|帮我生成|生成|出)"
+        r"(?:一张|一|个|张|幅|份|组|两)?(?P<desc>[^。，！!？?；;]{1,40}?)"
+        r"(?:的)?(?:图片|照片|美图|插画|壁纸|图画|图像|卡通图|图)$",
+        content, re.I)
+    if m:
+        desc = m.group("desc").rstrip("的个张").strip()
+        if desc:
+            return _clean_prompt(desc) or None
+
+    # ===== 正则全失败：用轻量 LLM 做意图判断（有弱信号词时才调用） =====
+    # 单个字符（如只发一个“图”/“画”）不足以构成绘图请求，直接返回，避免无谓的 LLM 调用
+    if len(content) < 2:
+        return None
+    # 如果文本不含任何绘画相关词汇，说明跟画图无关，直接返回 None
+    if not any(w in content for w in _WEAK_HINTS):
+        return None
+    return _classify_cached(content) or None
 
 
 def _handle_image_gen(from_user, to_user, msg_id, prompt):
@@ -89,9 +199,24 @@ def _handle_image_gen(from_user, to_user, msg_id, prompt):
             return None
         return upload_temp_media("image", img_bytes, "gen.jpg")
 
+    def _gen_and_record():
+        # 在后台线程执行；processor 每个 msg_id 只跑一次，重试不会重复记录
+        mid = _process_gen()
+        # 把绘画事件写入会话历史，让用户后续问"你刚刚画了什么"时 AI 有上下文
+        session_store.add_message(from_user, "user", f"画：{prompt}")
+        if mid:
+            session_store.add_message(
+                from_user, "assistant",
+                f"好的，我已根据「{prompt}」生成了一张图片并发送给你。")
+        else:
+            session_store.add_message(
+                from_user, "assistant",
+                f"抱歉，「{prompt}」的图片生成失败了，请稍后重试。")
+        return mid
+
     if _use_async():
         def _handle_gen_async():
-            mid = _process_gen()
+            mid = _gen_and_record()
             if mid:
                 send_customer_image(from_user, mid)
             else:
@@ -101,7 +226,7 @@ def _handle_image_gen(from_user, to_user, msg_id, prompt):
 
     # 同步模式（订阅号）：复用微信重试机制等待生成结果（文生图通常 10-30 秒）
     pending_key = msg_id or f"gen:{from_user}"
-    status, mid = get_or_start_image(pending_key, from_user, _process_gen, wait=4.8)
+    status, mid = get_or_start_image(pending_key, from_user, _gen_and_record, wait=4.8)
     if status == "done":
         if mid:
             logger.info("图片生成完成: msg_id=%s, media_id=%s", msg_id, mid)
