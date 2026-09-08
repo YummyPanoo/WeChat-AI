@@ -1,4 +1,4 @@
-import re, time, threading, logging, base64
+import re, time, threading, logging, base64, requests
 from typing import Optional
 from flask import Blueprint, request
 from defusedxml import ElementTree as SafeET
@@ -9,6 +9,7 @@ from app.services.message import send_customer_text, send_customer_image
 from app.services.pending import get_or_start, drain_ready, get_or_start_image, pop_pending_image, process_later
 from app.services.media import download_media, upload_temp_media, fetch_image_bytes
 from app.services.session import session_store
+from app.services.user_info import get_user_full_info, format_user_info_for_ai, get_user_by_openid
 from app.utils.xml_helper import build_text_xml, build_image_xml
 
 bp = Blueprint("wechat", __name__)
@@ -187,6 +188,53 @@ def parse_image_gen(content):
     return _classify_cached(content) or None
 
 
+def _query_user_subscription(username: str) -> str:
+    """
+    查询用户订阅信息（只读）。
+    供公众号AI在对话中查询用户使用。
+    注意：此函数仅读取数据，不做任何修改。
+    """
+    try:
+        info = get_user_full_info(username)
+        if not info:
+            return f"未找到用户「{username}」的注册信息。该用户可能尚未注册。"
+        return format_user_info_for_ai(info)
+    except Exception as e:
+        logger.warning("查询用户订阅信息失败: %s", str(e))
+        return f"查询用户信息时出错，请稍后重试。"
+
+
+def _call_wechat_register_bind_api(token: str, openid: str) -> dict:
+    """
+    调用 WeChatRegister 的绑定接口，将微信号与用户账号绑定。
+    返回 {"ok": bool, "msg": str}
+    """
+    try:
+        # WeChatRegister 后端地址（从前端地址推导，端口5000）
+        register_url = Config.WECHAT_REGISTER_FRONTEND_URL
+        # 将前端端口5173替换为后端端口5000
+        backend_url = register_url.replace(":5173", ":5000").rstrip("/")
+        api_url = f"{backend_url}/api/wechat/bind"
+
+        resp = requests.post(api_url, json={"token": token, "openid": openid}, timeout=10)
+        data = resp.json()
+        return data
+    except Exception as e:
+        logger.warning("调用WeChatRegister绑定接口失败: %s", str(e))
+        return {"ok": False, "msg": "绑定服务暂时不可用"}
+
+
+def _get_user_info_by_openid(openid: str) -> Optional[dict]:
+    """
+    通过openid查询用户信息（直接读数据库，只读）。
+    """
+    try:
+        return get_user_by_openid(openid)
+    except Exception as e:
+        logger.warning("通过openid查询用户失败: %s", str(e))
+        return None
+
+
 def _handle_image_gen(from_user, to_user, msg_id, prompt):
     """文生图：生成图片并上传微信拿 media_id，再回图片 XML（同步）或客服消息（异步）。"""
     def _process_gen():
@@ -257,11 +305,72 @@ def handle():
 
         # 1. 关注事件
         if msg_type == "event" and tree.findtext("Event") == "subscribe":
-            welcome = "你好！我是AI助手。\n发文字对话，发图片识别内容。\n回复 画：描述 可生成图片。"
+            # 检查该微信号是否已绑定用户账号
+            bound_user = _get_user_info_by_openid(from_user)
+            register_url = Config.WECHAT_REGISTER_FRONTEND_URL
+
+            if bound_user:
+                # 已绑定：显示用户信息和订阅状态
+                info = get_user_full_info(bound_user["username"])
+                if info:
+                    sub_info = format_user_info_for_ai(info)
+                    welcome = (
+                        f"🎉 欢迎回来，{bound_user['username']}！\n\n"
+                        f"📋 您的订阅信息：\n{sub_info}\n\n"
+                        f"【使用指南】\n"
+                        f"• 直接发文字与我对话\n"
+                        f"• 发图片可识别分析内容\n"
+                        f"• 回复 画：描述 可生成图片\n"
+                        f"• 回复 我的订单 可查看订购状态"
+                    )
+                else:
+                    welcome = (
+                        f"🎉 欢迎回来，{bound_user['username']}！\n\n"
+                        f"👉 管理您的服务：{register_url}\n\n"
+                        f"【使用指南】\n"
+                        f"• 直接发文字与我对话\n"
+                        f"• 发图片可识别分析内容\n"
+                        f"• 回复 画：描述 可生成图片"
+                    )
+            else:
+                # 未绑定：显示欢迎和注册引导
+                welcome = (
+                    "🎉 欢迎关注AI助手！\n\n"
+                    "【服务配额说明】\n"
+                    "✅ 文字对话：永久免费\n"
+                    "✅ 图片分析：注册后免费30天\n"
+                    "✅ 文生图：注册即送20次免费次数\n"
+                    "   （用完后可订阅30元/月）\n\n"
+                    f"👉 注册/登录/购买请访问：{register_url}\n\n"
+                    "💡 注册后请扫码绑定微信号，即可同步您的购买信息\n\n"
+                    "【使用指南】\n"
+                    "• 直接发文字与我对话\n"
+                    "• 发图片可识别分析内容\n"
+                    "• 回复 画：描述 可生成图片\n"
+                    "• 回复 我的订单 可查看订购状态"
+                )
             if _use_async():
                 send_customer_text(from_user, welcome)
                 return "success"
             return _xml_reply(from_user, to_user, welcome)
+
+        # 1.5 扫码事件（用户扫描绑定二维码）
+        if msg_type == "event" and tree.findtext("Event") == "scan":
+            event_key = tree.findtext("EventKey", "")
+            # 扫码绑定：EventKey 以 "bind_" 开头，后面是 token
+            if event_key.startswith("bind_"):
+                token = event_key[5:]  # 去掉 "bind_" 前缀
+                result = _call_wechat_register_bind_api(token, from_user)
+                if result.get("ok"):
+                    reply = "✅ 微信号绑定成功！\n\n您的公众号账号已与网站账号关联，现在可以同步查看您的订阅信息。\n\n回复「我的订单」查看订购状态。"
+                else:
+                    reply = f"❌ 绑定失败：{result.get('msg', '请重试')}\n\n请重新在网页端生成绑定二维码。"
+                if _use_async():
+                    send_customer_text(from_user, reply)
+                    return "success"
+                return _xml_reply(from_user, to_user, reply)
+            # 其他扫码场景（非绑定）
+            return "success"
 
         # 2. 图片消息
         if msg_type == "image":
@@ -310,6 +419,52 @@ def handle():
         if msg_type == "text":
             content = tree.findtext("Content", "").strip()
 
+            # 微信绑定码（6位数字）
+            if re.match(r"^\d{6}$", content):
+                # 用户发送了6位数字，尝试作为绑定码处理
+                result = _call_wechat_register_bind_api(content, from_user)
+                if result.get("ok"):
+                    reply = f"✅ 微信号绑定成功！\n\n您的公众号账号已与网站账号「{result.get('username', '')}」关联。\n\n回复「我的订单」查看订购状态。"
+                else:
+                    reply = f"❌ 绑定失败：{result.get('msg', '请重试')}\n\n请重新在网页端生成绑定码。"
+                if _use_async():
+                    send_customer_text(from_user, reply)
+                    return "success"
+                return _xml_reply(from_user, to_user, reply)
+
+            # 用户查询订购状态（只读，不修改任何数据）
+            _order_query_patterns = (
+                r"^(我的)?(订单|订阅|配额|余额|剩余|服务状态|订购状态|会员状态)$",
+                r"^(查询|查看|我的)(订单|订阅|配额|服务)$",
+                r"^(我还有|剩余).{0,4}(次数|免费|额度)$",
+                r"^我的(订购|服务|账号)信息$",
+            )
+            is_order_query = any(re.match(p, content) for p in _order_query_patterns)
+            if is_order_query:
+                # 检查是否已绑定微信号
+                bound_user = _get_user_info_by_openid(from_user)
+                if bound_user:
+                    # 已绑定：显示用户信息和订阅状态
+                    info = get_user_full_info(bound_user["username"])
+                    if info:
+                        sub_info = format_user_info_for_ai(info)
+                        reply = f"📋 您的订阅信息：\n\n{sub_info}"
+                    else:
+                        reply = "查询订阅信息失败，请稍后重试。"
+                else:
+                    # 未绑定：引导用户绑定
+                    register_url = Config.WECHAT_REGISTER_FRONTEND_URL
+                    reply = (
+                        "📋 订购信息查询\n\n"
+                        "您还未绑定微信号，无法直接查询。\n\n"
+                        f"👉 请登录网页端生成绑定码：{register_url}\n\n"
+                        "然后将6位绑定码发送给公众号即可完成绑定。"
+                    )
+                if _use_async():
+                    send_customer_text(from_user, reply)
+                    return "success"
+                return _xml_reply(from_user, to_user, reply)
+
             # 图片指令
             m = re.match(r"^图片\s*[:：]?\s*(https?://\S+)$", content)
             if m:
@@ -328,6 +483,21 @@ def handle():
                     return r
                 process_later(from_user, _q_overflow)  # 当前文字转入后台，其回复下次补发
                 return build_image_xml(from_user, to_user, overflow_mid), 200, {"Content-Type": "application/xml"}
+
+            # 查询指定用户的订阅信息（管理员/授权用途，只读）
+            # 格式：查询用户xxx的订单 / 查看用户xxx的订阅
+            _admin_query_match = re.match(
+                r"^(?:查询|查看|查看用户|查询用户)\s*(.+?)\s*(?:的)?\s*(?:订单|订阅|配额|信息|服务状态)$",
+                content
+            )
+            if _admin_query_match:
+                target_username = _admin_query_match.group(1).strip()
+                logger.info("查询用户订阅信息: username=%s", target_username)
+                reply = _query_user_subscription(target_username)
+                if _use_async():
+                    send_customer_text(from_user, reply)
+                    return "success"
+                return _xml_reply(from_user, to_user, reply)
 
             # 文生图指令：画：xxx / 生成图片 xxx / image xxx ...
             gen_prompt = parse_image_gen(content)

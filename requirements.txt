@@ -3,3 +3,4 @@ requests>=2.31
 defusedxml>=0.7
 waitress>=2.1
 python-dotenv>=1.0
+pymysql>=1.1
