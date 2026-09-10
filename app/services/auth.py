@@ -31,7 +31,14 @@ def get_access_token(force_refresh=False) -> Optional[str]:
             data = resp.json()
             token = data.get("access_token")
             if not token:
-                logger.error("获取 access_token 失败: %s", data)
+                hint = ""
+                if data.get("errcode") == 40125:
+                    hint = ("【提示】AppSecret 无效：请核对 .env 的 WECHAT_APPSECRET 是否与公众平台"
+                            "（mp.weixin.qq.com → 开发 → 基本配置）当前值一致；若曾重置过 AppSecret，"
+                            "旧值会立即失效并报 40125，需同步更新部署文件并重启。")
+                elif data.get("errcode") in (40013, 41002):
+                    hint = "【提示】WECHAT_APPID 无效或与 AppSecret 不匹配，请检查 .env。"
+                logger.error("获取 access_token 失败: %s %s", data, hint)
                 return None
             _token_cache["token"] = token
             _token_cache["expires_at"] = time.time() + int(data.get("expires_in", 7200)) - 200

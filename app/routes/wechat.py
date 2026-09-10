@@ -4,18 +4,37 @@ from flask import Blueprint, request
 from defusedxml import ElementTree as SafeET
 from config.settings import Config
 from app.services.auth import check_signature
-from app.services.ai_client import chat, vision, generate_image, classify_draw_intent
+from app.services.ai_client import (
+    chat, vision, generate_image, classify_draw_intent,
+    generate_image_from_image, parse_style, style_menu_text, IMAGE_STYLES,
+)
 from app.services.message import send_customer_text, send_customer_image
-from app.services.pending import get_or_start, drain_ready, get_or_start_image, pop_pending_image, process_later
+from app.services.pending import (
+    get_or_start, drain_ready, get_or_start_image, pop_pending_image,
+    process_later, has_unfinished_image,
+    set_i2i_stage, get_i2i_stage, clear_i2i,
+)
 from app.services.media import download_media, upload_temp_media, fetch_image_bytes
 from app.services.session import session_store
 from app.services.user_info import get_user_full_info, format_user_info_for_ai, get_user_by_openid
+from app.services.quota import check_quota, precheck_quota
 from app.utils.xml_helper import build_text_xml, build_image_xml
 
 bp = Blueprint("wechat", __name__)
 logger = logging.getLogger("wechat-robot")
 
 IMAGE_PROMPT = "请简要描述图片内容，提取文字并给出解读。用简洁中文回复。"
+
+# 用户发图后的意图选择菜单：不再默认直接分析，先让用户选"分析图片"还是"图生图"
+IMAGE_INTENT_MENU = (
+    "🖼️ 收到您的图片！请选择处理方式：\n\n"
+    "1️⃣ 图片分析 —— 识别内容、提取文字并解读\n"
+    "2️⃣ 图生图 —— 转换成漫画风/线条风/水彩风等艺术风格\n\n"
+    "请回复数字 1 或 2（3 分钟内有效，超时请重新发图）。"
+)
+
+# 原图 base64 体积上限：过大的 data URL 会让视觉/图生图请求缓慢甚至被服务端拒绝
+_MAX_IMAGE_REF_BYTES = 6 * 1024 * 1024
 
 # 同步模式下 AI 调用的超时时间（微信只等 5 秒，留 0.5s 余量）
 SYNC_TIMEOUT = 5
@@ -224,6 +243,22 @@ def _call_wechat_register_bind_api(token: str, openid: str) -> dict:
         return {"ok": False, "msg": "绑定服务暂时不可用"}
 
 
+def _call_wechat_register_unbind_api(openid: str) -> dict:
+    """
+    调用 WeChatRegister 的解绑接口，将微信号与网站账号解绑。
+    返回 {"ok": bool, "msg": str}
+    """
+    try:
+        register_url = Config.WECHAT_REGISTER_FRONTEND_URL
+        backend_url = register_url.replace(":5173", ":5000").rstrip("/")
+        api_url = f"{backend_url}/api/wechat/unbind"
+        resp = requests.post(api_url, json={"openid": openid}, timeout=10)
+        return resp.json()
+    except Exception as e:
+        logger.warning("调用WeChatRegister解绑接口失败: %s", str(e))
+        return {"ok": False, "msg": "解绑服务暂时不可用"}
+
+
 def _get_user_info_by_openid(openid: str) -> Optional[dict]:
     """
     通过openid查询用户信息（直接读数据库，只读）。
@@ -235,55 +270,427 @@ def _get_user_info_by_openid(openid: str) -> Optional[dict]:
         return None
 
 
+def _quota_reply(reason: str, service: str, detail: dict) -> str:
+    """
+    根据配额检查结果生成用户提示文案。
+    reason: not_bound 未绑定 | denied 配额不足/过期 | error 服务异常
+    """
+    register_url = Config.WECHAT_REGISTER_FRONTEND_URL
+    if reason == "not_bound":
+        return (
+            "⚠️ 您还未绑定微信号。\n\n"
+            "请先在网页端登录并生成绑定码：\n"
+            f"{register_url}\n\n"
+            "然后将6位绑定码发送给公众号即可完成绑定，之后即可正常使用全部服务。"
+        )
+    if reason == "error":
+        return "⚠️ 配额服务暂时不可用，请稍后再试。"
+    if service == "t2i":
+        return (
+            "⛔ 文生图服务不可用\n\n"
+            "您的免费次数已用完，且订阅已过期（或未订阅）。\n\n"
+            f"👉 请到网页端购买订阅（30元/月）后继续使用：\n"
+            f"{register_url}\n\n"
+            "回复「我的订单」可查看当前订阅状态。"
+        )
+    if service == "image_analysis":
+        return (
+            "⛔ 图片分析服务已过期\n\n"
+            "免费期为注册后 30 天，现已过期。\n\n"
+            f"👉 如需继续使用图片分析服务，请访问：\n{register_url}\n\n"
+            "文字对话仍可免费使用。"
+        )
+    if service == "i2i":
+        return (
+            "⛔ 图生图服务不可用\n\n"
+            "您的免费次数已用完，且订阅已过期（或未订阅）。\n\n"
+            f"👉 请到网页端购买订阅（20元/月）后继续使用：\n"
+            f"{register_url}\n\n"
+            "回复「我的订单」可查看当前订阅状态。"
+        )
+    return "⛔ 该服务暂不可用，请稍后重试。"
+
+
 def _handle_image_gen(from_user, to_user, msg_id, prompt):
-    """文生图：生成图片并上传微信拿 media_id，再回图片 XML（同步）或客服消息（异步）。"""
+    """文生图：预检配额 → 后台生成图片并上传微信拿 media_id → 回图片 XML（同步）或客服消息（异步）。"""
+    # 预检（只读，不消耗配额）：未绑定或额度明显不可用 → 即时回复，避免用户空等
+    precheck_msg = precheck_quota(from_user, "t2i")
+    if precheck_msg:
+        if _use_async():
+            send_customer_text(from_user, precheck_msg)
+            return "success"
+        return _xml_reply(from_user, to_user, precheck_msg)
+
     def _process_gen():
+        """生成并上传微信素材。返回 (media_id, image_url)；media_id 为 None 但
+        image_url 存在时表示生成成功但微信上传失败（可用链接兜底交付）。"""
         url = generate_image(prompt)
         if not url:
-            return None
+            return None, None
         img_bytes = fetch_image_bytes(url)
         if not img_bytes:
             logger.warning("生成图片下载失败: %s", url)
-            return None
-        return upload_temp_media("image", img_bytes, "gen.jpg")
+            # 图片 URL 仍然有效，降级为链接兜底
+            return None, url
+        return upload_temp_media("image", img_bytes, "gen.jpg"), url
 
     def _gen_and_record():
-        # 在后台线程执行；processor 每个 msg_id 只跑一次，重试不会重复记录
-        mid = _process_gen()
-        # 把绘画事件写入会话历史，让用户后续问"你刚刚画了什么"时 AI 有上下文
+        # 正式配额检查+消耗（processor 每个 msg_id 只跑一次，微信重试不会重复消耗）
+        allowed, reason, detail, user = check_quota(from_user, "t2i")
         session_store.add_message(from_user, "user", f"画：{prompt}")
+        if not allowed:
+            msg = _quota_reply(reason, "t2i", detail)
+            session_store.add_message(from_user, "assistant", f"[配额被拒]: {msg[:40]}...")
+            return ("denied", msg)
+        # 在后台线程执行；processor 每个 msg_id 只跑一次，重试不会重复记录
+        mid, gen_url = _process_gen()
+        # 把绘画事件写入会话历史，让用户后续问"你刚刚画了什么"时 AI 有上下文
         if mid:
             session_store.add_message(
                 from_user, "assistant",
                 f"好的，我已根据「{prompt}」生成了一张图片并发送给你。")
-        else:
+            return ("ok", mid)
+        if gen_url:
+            # 图片生成成功但微信素材上传失败（如 AppSecret 配置错误 / 临时限流）：
+            # 降级为链接兜底，避免用户以为生成失败
+            logger.warning("文生图已生成但微信上传失败，改用链接兜底: %s", gen_url[:120])
             session_store.add_message(
                 from_user, "assistant",
-                f"抱歉，「{prompt}」的图片生成失败了，请稍后重试。")
-        return mid
+                "图片已生成（微信素材上传受限，已附链接）。")
+            return ("url", gen_url)
+        session_store.add_message(
+            from_user, "assistant",
+            f"抱歉，「{prompt}」的图片生成失败了，请稍后重试。")
+        return ("fail", None)
 
     if _use_async():
         def _handle_gen_async():
-            mid = _gen_and_record()
-            if mid:
-                send_customer_image(from_user, mid)
+            kind, payload = _gen_and_record()
+            if kind == "ok" and payload:
+                send_customer_image(from_user, payload)
+            elif kind == "denied":
+                send_customer_text(from_user, payload)
+            elif kind == "url" and payload:
+                send_customer_text(from_user, _image_link_msg(f"已根据「{prompt}」生成图片", payload))
             else:
                 send_customer_text(from_user, "图片生成失败，请重试。")
         _async(_handle_gen_async)
         return "success"
 
     # 同步模式（订阅号）：复用微信重试机制等待生成结果（文生图通常 10-30 秒）
+    # 注意：图片生成完成后，pending 模块的后台线程会立即尝试通过客服接口主动推送
+    # 即使用户的微信请求已超时（超过 5 秒），用户也能及时收到图片
     pending_key = msg_id or f"gen:{from_user}"
-    status, mid = get_or_start_image(pending_key, from_user, _gen_and_record, wait=4.8)
+    status, result = get_or_start_image(pending_key, from_user, _gen_and_record, wait=4.8)
     if status == "done":
-        if mid:
-            logger.info("图片生成完成: msg_id=%s, media_id=%s", msg_id, mid)
-            return build_image_xml(from_user, to_user, mid), 200, {"Content-Type": "application/xml"}
-        return _xml_reply(from_user, to_user, "图片生成失败，请重试。")
+        kind, payload = result or ("fail", None)
+        return _deliver_image_result(from_user, to_user, msg_id, kind, payload,
+                                     f"已根据「{prompt}」生成图片", "图片生成失败，请重试。")
     else:
-        time.sleep(0.3)  # 4.8 + 0.3 = 5.1 秒 > 5 秒，确保微信判定超时并重试
-        logger.info("图片生成中，触发微信超时重试: msg_id=%s", msg_id)
-        return ""
+        # 图片生成通常需要 30-60 秒，远超微信 5 秒同步窗口：
+        # 订阅号无客服推送权限，完成后无法主动下发，只能等用户下一次发消息时补发。
+        # 这里如实告知等待时长和获取方式，避免用户干等或以为生成失败。
+        wait_msg = (
+            "🎨 正在为您生成图片，预计需要 30-60 秒。\n\n"
+            "⏳ 由于微信限制，图片生成完成后无法主动推送给您。\n\n"
+            "💡 请等待 30-60 秒后，发送任意消息（如：好了吗），即可获取图片。"
+        )
+        logger.info("图片生成中，发送等待提示: msg_id=%s", msg_id)
+        return _xml_reply(from_user, to_user, wait_msg)
+
+
+def _try_push_image_if_needed(openid, media_id, msg_id):
+    """尝试通过客服接口推送图片（如果客服接口可用且未推送过）。"""
+    try:
+        from app.services.message import send_customer_image
+        if send_customer_image(openid, media_id):
+            logger.info("图片已通过客服接口推送(双保险): msg_id=%s", msg_id)
+    except Exception:
+        logger.exception("推送图片异常: msg_id=%s", msg_id)
+
+
+def _text_response(from_user, to_user, text):
+    """统一的文本响应：异步模式走客服消息，同步模式回 XML。"""
+    if _use_async():
+        send_customer_text(from_user, text)
+        return "success"
+    return _xml_reply(from_user, to_user, text)
+
+
+def _image_link_msg(what: str, url: str) -> str:
+    """微信素材上传失败时的链接兜底文案（图片本身已生成成功）。"""
+    return (
+        f"🎨 {what}！\n\n"
+        "⚠️ 微信素材上传暂时受限，图片已通过链接发送：\n"
+        f"👉 {url}\n\n"
+        "点击链接即可在浏览器中查看/保存图片。"
+    )
+
+
+def _deliver_image_result(from_user, to_user, msg_id, kind, payload,
+                          what, reason_fail):
+    """统一的图片生成结果交付（文生图 / 图生图共用）。
+
+    kind 约定：
+      ("ok",   media_id)   生成成功且已上传微信素材 → 直接回图片 XML
+      ("url",  图片直链)    生成成功但微信上传失败   → 链接兜底文本
+      ("denied", 文案)      配额被拒                 → 原文案
+      其他                  生成失败                 → reason_fail
+    """
+    if kind == "ok" and payload:
+        logger.info("图片交付: msg_id=%s, media_id=%s", msg_id, payload)
+        # 双保险：若后台线程还未推送，这里再尝试一次客服推送
+        _try_push_image_if_needed(from_user, payload, msg_id)
+        return build_image_xml(from_user, to_user, payload), 200, {"Content-Type": "application/xml"}
+    if kind == "url" and payload:
+        logger.warning("图片已生成但微信素材上传失败，改用链接兜底: msg_id=%s, url=%s",
+                       msg_id, str(payload)[:120])
+        return _xml_reply(from_user, to_user, _image_link_msg(what, payload))
+    if kind == "denied":
+        return _xml_reply(from_user, to_user, payload)
+    logger.warning("图片生成失败: msg_id=%s, kind=%s", msg_id, kind)
+    return _xml_reply(from_user, to_user, reason_fail)
+
+
+def _resolve_image_ref(pic_url, media_id):
+    """把微信图片消息解析成可直接提交给模型的图片引用。
+
+    优先用 PicUrl（公网地址，省去下载）；缺失时下载素材并转 base64 data URL。
+    返回 (image_ref, err_msg)，失败时 image_ref 为空串。
+    """
+    if pic_url:
+        return pic_url, None
+    if not media_id:
+        return "", "⚠️ 未获取到图片数据，请重新发送图片。"
+    content, ctype = download_media(media_id)
+    if not content:
+        return "", "⚠️ 图片下载失败，请重新发送图片。"
+    if len(content) > _MAX_IMAGE_REF_BYTES:
+        return "", "⚠️ 图片过大（超过 6MB），请压缩后重新发送。"
+    mime = (ctype or "image/jpeg").split(";")[0]
+    return f"data:{mime};base64,{base64.b64encode(content).decode()}", None
+
+
+def _run_image_analysis(from_user, to_user, msg_id, image_url):
+    """图片分析：调用视觉模型解读图片内容（用户选择「1」后触发）。
+
+    幂等：pending 层按 msg_id 去重，微信重试同一条消息不会重复消耗配额。
+    """
+    # 预检（只读，不消耗配额）：未绑定或免费期已过 → 即时回复
+    img_precheck = precheck_quota(from_user, "image_analysis")
+    if img_precheck:
+        clear_i2i(from_user)
+        return _text_response(from_user, to_user, img_precheck)
+
+    def _process_img():
+        """正式配额检查 + 视觉模型分析，写入会话历史，返回分析文本"""
+        # get_or_start 保证整个 msg_id 只执行一次，微信重试不会重复消耗
+        allowed, reason, detail, user = check_quota(from_user, "image_analysis")
+        if not allowed:
+            msg = _quota_reply(reason, "image_analysis", detail)
+            session_store.add_message(from_user, "user", "[用户发送了一张图片]")
+            session_store.add_message(from_user, "assistant", f"[图片分析被拒]: {msg[:40]}...")
+            return msg
+        reply = vision(image_url, IMAGE_PROMPT)
+        reply = reply or "（模型未返回）"
+        # 写入会话历史，让后续文字对话能引用图片内容
+        session_store.add_message(from_user, "user", "[用户发送了一张图片]")
+        session_store.add_message(from_user, "assistant", f"[图片分析]: {reply}")
+        return reply
+
+    # --- 异步模式（有客服权限）：后台分析 + 客服消息推送 ---
+    if _use_async():
+        def _handle_img_async():
+            send_customer_text(from_user, _process_img())
+        _async(_handle_img_async)
+        return "success"
+
+    # --- 同步模式（订阅号）：复用微信重试机制等待分析结果 ---
+    # 第一次启动后台分析等 4.8 秒：完成则立即返回 XML；未完成则返回空触发微信超时重试，
+    # 重试携带同一 msg_id，get_or_start 会取出已完成的结果。
+    pending_key = msg_id or f"img:{from_user}"
+    status, reply = get_or_start(pending_key, from_user, _process_img, wait=4.8)
+
+    if status == "done":
+        # 微信被动回复文本有长度限制（约 2048 字节），超长会被微信直接丢弃、
+        # 用户侧表现为"没收到"。VL 模型 max_tokens=800 时很容易超限，这里截断保底。
+        full_len = len(reply or "")
+        logger.info("图片分析回复(长度%d): %s", full_len, (reply or "")[:80])
+        safe_reply = reply or ""
+        if full_len > 1200:
+            safe_reply = safe_reply[:1200] + "\n...(内容较长，已截断)"
+        clear_i2i(from_user)
+        return _xml_reply(from_user, to_user, _with_backfill(from_user, safe_reply))
+    # 4.8 + 0.3 = 5.1 秒 > 5 秒，确保微信判定超时并重试
+    time.sleep(0.3)
+    logger.info("图片分析中，触发微信超时重试: msg_id=%s", msg_id)
+    return ""
+
+
+def _run_image_to_image(from_user, to_user, msg_id, image_url, style_code):
+    """图生图：按所选风格重绘用户原图（用户选完风格后触发）。
+
+    与文生图共用交付机制：后台生成 → 上传微信素材 → 图片 XML / 客服消息 / 下一条补发。
+    """
+    style_name = (IMAGE_STYLES.get(style_code) or {}).get("name", "所选风格")
+
+    # 预检（只读，不消耗配额）：未绑定或额度不可用 → 即时回复，避免用户空等
+    precheck_msg = precheck_quota(from_user, "i2i")
+    if precheck_msg:
+        clear_i2i(from_user)
+        return _text_response(from_user, to_user, precheck_msg)
+
+    def _process_i2i():
+        """生成并上传微信素材。返回 (media_id, image_url)；media_id 为 None 但
+        image_url 存在时表示生成成功但微信上传失败（可用链接兜底交付）。"""
+        url = generate_image_from_image(image_url, style_code)
+        if not url:
+            return None, None
+        img_bytes = fetch_image_bytes(url)
+        if not img_bytes:
+            logger.warning("图生图结果下载失败: %s", url)
+            # 图片 URL 仍然有效，降级为链接兜底
+            return None, url
+        return upload_temp_media("image", img_bytes, "i2i.jpg"), url
+
+    def _i2i_and_record():
+        # 正式配额检查+消耗（processor 每个 msg_id 只跑一次，微信重试不会重复消耗）
+        allowed, reason, detail, user = check_quota(from_user, "i2i")
+        session_store.add_message(from_user, "user", f"[图生图：{style_name}]")
+        if not allowed:
+            msg = _quota_reply(reason, "i2i", detail)
+            session_store.add_message(from_user, "assistant", f"[配额被拒]: {msg[:40]}...")
+            return ("denied", msg)
+        mid, gen_url = _process_i2i()
+        # 写入会话历史，用户后续问"你刚做了什么"时 AI 有上下文
+        if mid:
+            session_store.add_message(
+                from_user, "assistant",
+                f"好的，我已把您的图片转换成{style_name}并发送给你。")
+            return ("ok", mid)
+        if gen_url:
+            # 图片生成成功但微信素材上传失败（如 AppSecret 配置错误 / 临时限流）：
+            # 降级为链接兜底，避免用户以为生成失败
+            logger.warning("图生图已生成但微信上传失败，改用链接兜底: %s", gen_url[:120])
+            session_store.add_message(
+                from_user, "assistant",
+                f"您的图片已转换为{style_name}（微信素材上传受限，已附链接）。")
+            return ("url", gen_url)
+        session_store.add_message(
+            from_user, "assistant",
+            f"抱歉，{style_name}转换失败了，请稍后重试。")
+        return ("fail", None)
+
+    # --- 异步模式（有客服权限）：后台生成 + 客服消息推送 ---
+    if _use_async():
+        def _handle_i2i_async():
+            kind, payload = _i2i_and_record()
+            if kind == "ok" and payload:
+                send_customer_image(from_user, payload)
+            elif kind == "denied":
+                send_customer_text(from_user, payload)
+            elif kind == "url" and payload:
+                send_customer_text(from_user, _image_link_msg(f"图片已成功转换为「{style_name}」", payload))
+            else:
+                send_customer_text(from_user, f"图生图（{style_name}）失败，请重试。")
+        _async(_handle_i2i_async)
+        return "success"
+
+    # --- 同步模式（订阅号）：复用微信重试机制等待生成结果 ---
+    pending_key = msg_id or f"i2i:{from_user}"
+    status, result = get_or_start_image(pending_key, from_user, _i2i_and_record, wait=4.8)
+    if status == "done":
+        kind, payload = result or ("fail", None)
+        clear_i2i(from_user)
+        return _deliver_image_result(from_user, to_user, msg_id, kind, payload,
+                                     f"图片已成功转换为「{style_name}」",
+                                     f"图生图（{style_name}）失败，请重试。")
+
+    # 生成通常需要 30-60 秒，远超微信 5 秒同步窗口：订阅号无客服推送权限，
+    # 完成后无法主动下发，只能等用户下一次发消息时由 pop_pending_image 补发。
+    # 这里如实告知等待时长和获取方式，避免用户干等或以为生成失败。
+    wait_msg = (
+        f"🎨 正在把您的图片转换为{style_name}，预计需要 30-60 秒。\n\n"
+        "⏳ 由于微信限制，生成完成后无法主动推送给您。\n\n"
+        "💡 请等待 30-60 秒后，发送任意消息（如：好了吗），即可获取图片。"
+    )
+    logger.info("图生图生成中，发送等待提示: msg_id=%s, style=%s", msg_id, style_name)
+    return _xml_reply(from_user, to_user, wait_msg)
+
+
+def _dispatch_image_task(from_user, to_user, msg_id, kind, image_url, style_code=None):
+    """启动图片分析 / 图生图任务，并把交互状态推进到 busy。
+
+    记录触发任务的 msg_id：微信若重试同一条选择消息，可据此续接同一个后台任务，
+    而不是把重试当成一条新消息处理（否则已生成的结果会丢失交付时机）。
+    """
+    set_i2i_stage(from_user, "busy", image_url,
+                  msg_id=msg_id, kind=kind, style_code=style_code)
+    if kind == "analysis":
+        return _run_image_analysis(from_user, to_user, msg_id, image_url)
+    return _run_image_to_image(from_user, to_user, msg_id, image_url, style_code)
+
+
+def _resume_busy(from_user, to_user, st):
+    """微信重试同一条选择消息时，续接已启动的分析 / 图生图任务。"""
+    # 刷新状态时间戳，避免长任务期间交互状态被 TTL 清掉
+    set_i2i_stage(from_user, "busy", st.get("image_url"), msg_id=st.get("msg_id"),
+                  kind=st.get("kind"), style_code=st.get("style_code"))
+    if st.get("kind") == "analysis":
+        return _run_image_analysis(from_user, to_user, st.get("msg_id"), st.get("image_url"))
+    return _run_image_to_image(from_user, to_user, st.get("msg_id"),
+                               st.get("image_url"), st.get("style_code"))
+
+
+def _handle_image_choice(from_user, to_user, msg_id, content):
+    """处理「图片分析 / 图生图」的意图与风格选择。
+
+    返回 HTTP 响应；若当前消息与图片交互无关（无交互状态 / 任务已派发后用户发了新消息），
+    返回 None，由调用方继续走常规文本流程。
+    """
+    st = get_i2i_stage(from_user)
+    if not st:
+        return None
+    stage = st.get("stage")
+
+    # busy：任务已启动。微信重试同一条选择消息时续接结果；用户发新消息则不拦截，
+    # 让常规流程里的 pop_pending_image / drain_ready 把结果补发出去。
+    if stage == "busy":
+        if st.get("msg_id") != msg_id:
+            return None
+        return _resume_busy(from_user, to_user, st)
+
+    text = (content or "").strip()
+    if text in ("取消", "算了", "不用了", "退出", "cancel"):
+        clear_i2i(from_user)
+        return _text_response(from_user, to_user, "✅ 已取消，需要时重新发送图片即可。")
+
+    if stage == "ask_intent":
+        if text in ("1", "分析", "分析图片", "图片分析", "识别", "解读"):
+            return _dispatch_image_task(from_user, to_user, msg_id, "analysis",
+                                        st.get("image_url"))
+        if text in ("2", "图生图", "换风格", "风格转换", "生成图片", "生图"):
+            set_i2i_stage(from_user, "ask_style", st.get("image_url"), msg_id=msg_id)
+            return _text_response(from_user, to_user, style_menu_text())
+        # 未识别：重复菜单并给出退出方式，避免用户卡在选择态
+        return _text_response(
+            from_user, to_user,
+            IMAGE_INTENT_MENU + "\n\n（未识别您的选择，请回复 1 或 2；回复「取消」退出）")
+
+    if stage == "ask_style":
+        if text in ("返回", "上一步"):
+            set_i2i_stage(from_user, "ask_intent", st.get("image_url"), msg_id=msg_id)
+            return _text_response(from_user, to_user, IMAGE_INTENT_MENU)
+        style_code = parse_style(text)
+        if not style_code:
+            return _text_response(
+                from_user, to_user,
+                style_menu_text() + "\n\n（未识别风格，请回复数字 1-7；回复「取消」退出）")
+        return _dispatch_image_task(from_user, to_user, msg_id, "i2i",
+                                    st.get("image_url"), style_code)
+
+    return None
+
 
 
 @bp.route("/wechat", methods=["GET", "POST"])
@@ -319,7 +726,8 @@ def handle():
                         f"📋 您的订阅信息：\n{sub_info}\n\n"
                         f"【使用指南】\n"
                         f"• 直接发文字与我对话\n"
-                        f"• 发图片可识别分析内容\n"
+                        f"• 发图片后可选「图片分析」或「图生图」\n"
+                        f"• 图生图支持漫画风/线条风/水彩风等7种风格\n"
                         f"• 回复 画：描述 可生成图片\n"
                         f"• 回复 我的订单 可查看订购状态"
                     )
@@ -329,7 +737,7 @@ def handle():
                         f"👉 管理您的服务：{register_url}\n\n"
                         f"【使用指南】\n"
                         f"• 直接发文字与我对话\n"
-                        f"• 发图片可识别分析内容\n"
+                        f"• 发图片后可选「图片分析」或「图生图」\n"
                         f"• 回复 画：描述 可生成图片"
                     )
             else:
@@ -340,12 +748,15 @@ def handle():
                     "✅ 文字对话：永久免费\n"
                     "✅ 图片分析：注册后免费30天\n"
                     "✅ 文生图：注册即送20次免费次数\n"
-                    "   （用完后可订阅30元/月）\n\n"
+                    "   （用完后可订阅30元/月）\n"
+                    "✅ 图生图：注册即送10次免费次数\n"
+                    "   （用完后可订阅20元/月）\n\n"
                     f"👉 注册/登录/购买请访问：{register_url}\n\n"
                     "💡 注册后请扫码绑定微信号，即可同步您的购买信息\n\n"
                     "【使用指南】\n"
                     "• 直接发文字与我对话\n"
-                    "• 发图片可识别分析内容\n"
+                    "• 发图片后可选「图片分析」或「图生图」\n"
+                    "• 图生图支持漫画风/线条风/水彩风等7种风格\n"
                     "• 回复 画：描述 可生成图片\n"
                     "• 回复 我的订单 可查看订购状态"
                 )
@@ -354,7 +765,19 @@ def handle():
                 return "success"
             return _xml_reply(from_user, to_user, welcome)
 
-        # 1.5 扫码事件（用户扫描绑定二维码）
+        # 1.5 取消关注事件（自动解绑网页账号）
+        if msg_type == "event" and tree.findtext("Event") == "unsubscribe":
+            logger.info("用户取消关注: openid=%s，尝试自动解绑", from_user[:8] if from_user else "")
+            result = _call_wechat_register_unbind_api(from_user)
+            if result.get("ok"):
+                logger.info("自动解绑成功: openid=%s", from_user[:8] if from_user else "")
+            else:
+                logger.warning("自动解绑失败: openid=%s, msg=%s",
+                               from_user[:8] if from_user else "", result.get("msg", ""))
+            # 取消关注时微信不期望回复内容，统一返回 success
+            return "success"
+
+        # 1.6 扫码事件（用户扫描绑定二维码）
         if msg_type == "event" and tree.findtext("Event") == "scan":
             event_key = tree.findtext("EventKey", "")
             # 扫码绑定：EventKey 以 "bind_" 开头，后面是 token
@@ -372,48 +795,37 @@ def handle():
             # 其他扫码场景（非绑定）
             return "success"
 
-        # 2. 图片消息
+        # 2. 图片消息：先询问用户意图（分析图片 / 图生图），不再默认直接分析
         if msg_type == "image":
             pic_url = tree.findtext("PicUrl")
             media_id = tree.findtext("MediaId")
 
-            def _process_img():
-                """下载图片并调用视觉模型分析，写入会话历史，返回分析文本"""
-                img_ref = pic_url
-                if not img_ref and media_id:
-                    content, ctype = download_media(media_id)
-                    if content:
-                        mime = (ctype or "image/jpeg").split(";")[0]
-                        img_ref = f"data:{mime};base64,{base64.b64encode(content).decode()}"
-                reply = vision(img_ref, IMAGE_PROMPT) if img_ref else "图片读取失败"
-                reply = reply or "（模型未返回）"
-                # 写入会话历史，让后续文字对话能引用图片内容
-                session_store.add_message(from_user, "user", "[用户发送了一张图片]")
-                session_store.add_message(from_user, "assistant", f"[图片分析]: {reply}")
-                return reply
+            # 原图统一解析成模型可用的引用（PicUrl 或 base64 data URL），随交互状态一起缓存，
+            # 用户选完功能/风格后直接复用，避免二次下载微信素材。
+            # 绝大多数微信图片消息都带 PicUrl，因此这里通常零耗时，稳稳落在 5 秒窗口内。
+            image_url, img_err = _resolve_image_ref(pic_url, media_id)
+            if img_err:
+                return _text_response(from_user, to_user, img_err)
 
-            # --- 异步模式（有客服权限）：后台分析 + 客服消息推送 ---
-            if _use_async():
-                def _handle_img_async():
-                    reply = _process_img()
-                    send_customer_text(from_user, reply)
-                _async(_handle_img_async)
-                return "success"
+            # 提前只读预检两项服务：都不可用时直接告知，避免用户走完"选功能→选风格"
+            # 三轮交互才发现用不了。只有一项不可用时仍在菜单上标注，保留另一项的可用性。
+            analysis_denial = precheck_quota(from_user, "image_analysis")
+            i2i_denial = precheck_quota(from_user, "i2i")
+            if analysis_denial and i2i_denial:
+                combined = (analysis_denial if analysis_denial == i2i_denial
+                            else f"{analysis_denial}\n\n————\n\n{i2i_denial}")
+                logger.info("图片两项服务均不可用，直接告知: user=%s", from_user[:8] if from_user else "")
+                return _text_response(from_user, to_user, combined)
 
-            # --- 同步模式（订阅号）：复用微信重试机制等待分析结果 ---
-            # 与文本消息相同：第一次启动后台分析等 4.8 秒
-            #   - 分析完成：立即返回 XML 结果给用户
-            #   - 未完成：空响应触发微信超时重试，重试时返回分析结果
-            pending_key = msg_id or f"img:{from_user}"
-            status, reply = get_or_start(pending_key, from_user, _process_img, wait=4.8)
+            menu = IMAGE_INTENT_MENU
+            if i2i_denial:
+                menu += "\n\n⚠️ 图生图当前不可用：额度已用完或订阅已过期。"
+            elif analysis_denial:
+                menu += "\n\n⚠️ 图片分析当前不可用：免费期已过。"
 
-            if status == "done":
-                logger.info("图片分析回复: %s", (reply or "")[:80])
-                return _xml_reply(from_user, to_user, _with_backfill(from_user, reply))
-            else:
-                time.sleep(0.3)  # 4.8 + 0.3 = 5.1 秒 > 5 秒，确保微信判定超时并重试
-                logger.info("图片分析中，触发微信超时重试: msg_id=%s", msg_id)
-                return ""
+            set_i2i_stage(from_user, "ask_intent", image_url, msg_id=msg_id)
+            logger.info("图片意图询问: msg_id=%s, ref=%dKB", msg_id, len(image_url) // 1024)
+            return _text_response(from_user, to_user, menu)
 
         # 3. 文本消息（带上下文记忆）
         if msg_type == "text":
@@ -431,6 +843,13 @@ def handle():
                     send_customer_text(from_user, reply)
                     return "success"
                 return _xml_reply(from_user, to_user, reply)
+
+            # 图片功能选择（图片分析 / 图生图）：用户发图后进入选择态。
+            # 必须放在常规文本流程之前拦截，否则 "1"/"2" 会被当成普通聊天消息发给 AI。
+            # 注意：绑定码是 6 位纯数字，风格选择是 1-7 单个数字，两者不会冲突。
+            img_choice_resp = _handle_image_choice(from_user, to_user, msg_id, content)
+            if img_choice_resp is not None:
+                return img_choice_resp
 
             # 用户查询订购状态（只读，不修改任何数据）
             _order_query_patterns = (
@@ -473,6 +892,13 @@ def handle():
             # 交付上一轮超时未送达的生成图片（文生图超过重试窗口时的补发）
             overflow_mid = pop_pending_image(from_user)
             if overflow_mid:
+                # 兼容新的 (kind, payload) 元组返回值：
+                #   ("ok", media_id) / ("url", 图片直链) / ("denied", msg) / ("fail", None)
+                if isinstance(overflow_mid, tuple):
+                    gen_kind, gen_payload = overflow_mid
+                else:
+                    gen_kind, gen_payload = "ok", overflow_mid
+
                 def _q_overflow():
                     h = session_store.get_history(from_user)
                     r = chat(content, history=h, timeout=30)
@@ -482,7 +908,14 @@ def handle():
                     session_store.add_message(from_user, "assistant", r)
                     return r
                 process_later(from_user, _q_overflow)  # 当前文字转入后台，其回复下次补发
-                return build_image_xml(from_user, to_user, overflow_mid), 200, {"Content-Type": "application/xml"}
+
+                if gen_kind == "ok" and gen_payload:
+                    return build_image_xml(from_user, to_user, gen_payload), 200, {"Content-Type": "application/xml"}
+                if gen_kind == "url" and gen_payload:
+                    return _xml_reply(from_user, to_user, _image_link_msg("图片已生成", gen_payload))
+                if gen_kind == "denied":
+                    return _xml_reply(from_user, to_user, gen_payload)
+                return _xml_reply(from_user, to_user, "图片生成失败，请尝试其他描述或稍后重试。")
 
             # 查询指定用户的订阅信息（管理员/授权用途，只读）
             # 格式：查询用户xxx的订单 / 查看用户xxx的订阅
@@ -543,7 +976,14 @@ def handle():
             if status == "done":
                 logger.info("AI回复: %s", (reply or "")[:80])
                 # 当前回复优先；若上一条超时未送达，补发拼接在前面
-                return _xml_reply(from_user, to_user, _with_backfill(from_user, reply))
+                reply_text = _with_backfill(from_user, reply)
+                # 若用户之前请求的文生图仍在后台生成，追加提示，避免用户以为图片丢失
+                try:
+                    if has_unfinished_image(from_user):
+                        reply_text += "\n\n🎨 您之前的图片还在生成中，请稍等片刻后发送任意消息（如：好了吗）即可获取。"
+                except Exception:
+                    pass
+                return _xml_reply(from_user, to_user, reply_text)
             else:
                 # 关键修复：必须让请求超过微信 5 秒限制才会触发重试
                 # 微信文档明确：返回 success 或空字符串"不会重试"，只有 5 秒超时不响应才重试

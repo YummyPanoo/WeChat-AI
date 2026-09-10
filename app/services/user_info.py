@@ -83,7 +83,8 @@ def get_user_by_openid(openid: str) -> Optional[dict]:
 def get_user_entitlements(user_id: int) -> Optional[dict]:
     """获取用户配额信息（剩余免费次数、订阅状态等）。"""
     return _UserInfoDB.query_one(
-        "SELECT image_free_until, t2i_free_left, t2i_sub_expire_at "
+        "SELECT image_free_until, t2i_free_left, t2i_sub_expire_at, "
+        "i2i_free_left, i2i_sub_expire_at "
         "FROM entitlements WHERE user_id=%s",
         (user_id,),
     )
@@ -162,6 +163,11 @@ def format_user_info_for_ai(info: dict) -> str:
         lines.append(f"文生图订阅到期: {ent['t2i_sub_expire_at']}")
     else:
         lines.append("文生图订阅: 未订阅")
+    lines.append(f"图生图剩余免费次数: {ent.get('i2i_free_left', 0)}")
+    if ent.get("i2i_sub_expire_at"):
+        lines.append(f"图生图订阅到期: {ent['i2i_sub_expire_at']}")
+    else:
+        lines.append("图生图订阅: 未订阅")
 
     # 订单信息
     if orders:

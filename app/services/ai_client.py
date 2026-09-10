@@ -182,3 +182,158 @@ def generate_image(prompt: str, size: str = "1024*1024", timeout: int = 120):
     except Exception:
         logger.exception("ModelScope 文生图异常")
         return None
+
+
+# ==================== 图生图（风格转换） ====================
+# 风格预设：name 用于菜单展示，prompt 为喂给绘图模型的英文风格描述
+IMAGE_STYLES = {
+    "1": {"name": "漫画风", "prompt": "Japanese anime comic style, clean bold outlines, vibrant flat colors, cel shading, manga aesthetic"},
+    "2": {"name": "线条风", "prompt": "minimalist black and white line art, clean ink sketch, fine contour lines, no color fill, white background"},
+    "3": {"name": "真实风", "prompt": "hyper-realistic photography style, natural lighting, true-to-life colors, high detail, 8k photo quality"},
+    "4": {"name": "水彩风", "prompt": "soft watercolor painting, gentle color bleeding, delicate brush strokes, artistic paper texture"},
+    "5": {"name": "油画风", "prompt": "classical oil painting, thick impasto brush strokes, rich warm palette, canvas texture"},
+    "6": {"name": "像素风", "prompt": "retro pixel art, 16-bit video game style, crisp square pixels, limited vibrant palette"},
+    "7": {"name": "赛博朋克", "prompt": "cyberpunk style, neon glow, futuristic high-tech atmosphere, cyan and magenta lighting, dark tones"},
+}
+
+# 中文关键词 → 风格编号，方便用户直接说"水彩风"而不必记数字
+_STYLE_KEYWORDS = {
+    "漫画": "1", "动漫": "1", "二次元": "1", "卡通": "1",
+    "线条": "2", "线稿": "2", "素描": "2", "简笔画": "2",
+    "真实": "3", "写实": "3", "摄影": "3", "实拍": "3",
+    "水彩": "4",
+    "油画": "5",
+    "像素": "6",
+    "赛博": "7", "朋克": "7", "科幻": "7", "霓虹": "7",
+}
+
+
+def parse_style(text: str) -> str:
+    """把用户回复解析成风格编号；无法识别返回空串。"""
+    t = (text or "").strip()
+    if t in IMAGE_STYLES:
+        return t
+    for kw, code in _STYLE_KEYWORDS.items():
+        if kw in t:
+            return code
+    return ""
+
+
+def style_menu_text() -> str:
+    """生成风格选择菜单文本。"""
+    lines = ["🎨 请选择图生图风格（回复数字或风格名）：", ""]
+    for code in sorted(IMAGE_STYLES.keys()):
+        lines.append(f"{code}. {IMAGE_STYLES[code]['name']}")
+    lines.append("")
+    lines.append("回复「取消」放弃本次图生图。")
+    return "\n".join(lines)
+
+
+def _build_i2i_prompt(style_code: str, base_desc: str = "") -> str:
+    """拼接图生图提示词：保留原图主体构图 + 目标风格化。"""
+    style = IMAGE_STYLES.get(style_code) or IMAGE_STYLES["1"]
+    parts = [
+        f"Redraw the input image in {style['prompt']}.",
+        "Keep the original subject, composition and layout recognizable.",
+        "High quality, detailed, well composed.",
+    ]
+    if base_desc:
+        parts.append(f"Original image content: {base_desc[:300]}")
+    return " ".join(parts)
+
+
+
+def generate_image_from_image(image_url: str, style_code: str, timeout: int = 150):
+    """图生图（ModelScope API-Inference 图像编辑），返回生成图片 URL；失败返回 None。
+
+    image_url: 原图的 base64 data URL（data:image/jpeg;base64,...）或公网 URL。
+    与文生图共用异步任务接口，额外把原图作为参考图一起提交。
+    """
+    if not Config.MODELSCOPE_API_KEY:
+        logger.warning("MODELSCOPE_API_KEY 未配置，无法图生图")
+        return None
+    key = Config.MODELSCOPE_API_KEY
+    base = "https://api-inference.modelscope.cn"
+    model = Config.MODELSCOPE_I2I_MODEL
+    prompt = _build_i2i_prompt(style_code)
+    style_name = (IMAGE_STYLES.get(style_code) or {}).get("name", style_code)
+
+    # 不同图像编辑模型对"参考图"字段命名不统一，按顺序尝试已知写法
+    payloads = [
+        {"model": model, "prompt": prompt, "image_url": image_url},
+        {"model": model, "prompt": prompt, "image": image_url},
+        {"model": model, "prompt": prompt, "input_image": image_url},
+        {"model": model, "prompt": prompt, "image_urls": [image_url]},
+    ]
+    logger.info("提交图生图任务: model=%s, style=%s(%s), 候选payload=%d",
+                model, style_code, style_name, len(payloads))
+
+    for idx, payload in enumerate(payloads, 1):
+        try:
+            resp = _session.post(
+                f"{base}/v1/images/generations",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    "X-ModelScope-Async-Mode": "true",
+                },
+                json=payload,
+                timeout=60,
+            )
+            if resp.status_code >= 400:
+                logger.warning("图生图 payload#%d 被拒绝: HTTP %d, %s",
+                               idx, resp.status_code, resp.text[:200])
+                continue
+            data = resp.json()
+            task_id = data.get("task_id")
+            if not task_id:
+                logger.warning("图生图 payload#%d 未返回 task_id: %s", idx, str(data)[:200])
+                continue
+            logger.info("图生图任务已提交: task_id=%s, payload#%d", task_id, idx)
+            url = _poll_image_task(base, key, task_id, timeout)
+            if url:
+                logger.info("图生图完成: style=%s, url=%s", style_name, str(url)[:80])
+            else:
+                logger.warning("图生图任务未产出图片: style=%s, task_id=%s", style_name, task_id)
+            # 任务已被服务端接受，再换 payload 重试意义不大，直接返回结果
+            return url
+        except requests.exceptions.Timeout:
+            logger.warning("图生图 payload#%d 提交超时", idx)
+        except Exception:
+            logger.exception("图生图 payload#%d 异常", idx)
+    logger.warning("图生图全部 payload 变体均失败: model=%s, style=%s", model, style_name)
+    return None
+
+
+def _poll_image_task(base: str, key: str, task_id: str, timeout: int):
+    """轮询 ModelScope 图像任务直到成功/失败/超时，返回图片 URL 或 None。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(5)
+        try:
+            pr = _session.get(
+                f"{base}/v1/tasks/{task_id}",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "X-ModelScope-Task-Type": "image_generation",
+                },
+                timeout=30,
+            )
+            pr.raise_for_status()
+            p = pr.json()
+        except Exception:
+            logger.warning("图生图轮询异常，继续重试: task_id=%s", task_id)
+            continue
+        status = p.get("task_status")
+        if status == "SUCCEED":
+            images = p.get("output_images") or []
+            if images:
+                return images[0]
+            logger.warning("图生图任务成功但无图片: %s", str(p)[:200])
+            return None
+        if status in ("FAILED", "CANCELED"):
+            logger.warning("图生图任务失败: status=%s, %s", status, str(p)[:200])
+            return None
+        # PENDING / RUNNING 继续轮询
+    logger.warning("图生图轮询超时: task_id=%s", task_id)
+    return None
